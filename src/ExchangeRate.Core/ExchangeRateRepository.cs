@@ -23,6 +23,12 @@ namespace ExchangeRate.Core
         private Dictionary<(ExchangeRateSources, ExchangeRateFrequencies), DateTime> _minFxDateBySourceAndFrequency;
         private readonly Dictionary<CurrencyTypes, PeggedCurrency> _peggedCurrencies;
 
+        /// <summary>
+        /// Tracks which months have been fully loaded to prevent redundant API calls.
+        /// Key: (Source, Frequency, Year, Month)
+        /// </summary>
+        private readonly HashSet<(ExchangeRateSources, ExchangeRateFrequencies, int Year, int Month)> _loadedMonths;
+
         private readonly IExchangeRateDataStore _dataStore;
 
         private readonly ILogger<ExchangeRateRepository> _logger;
@@ -52,6 +58,7 @@ namespace ExchangeRate.Core
             _exchangeRateSourceFactory = exchangeRateSourceFactory ?? throw new ArgumentNullException(nameof(exchangeRateSourceFactory));
 
             _fxRatesBySourceFrequencyAndCurrency = new Dictionary<(ExchangeRateSources, ExchangeRateFrequencies), Dictionary<CurrencyTypes, Dictionary<DateTime, decimal>>>();
+            _loadedMonths = new HashSet<(ExchangeRateSources, ExchangeRateFrequencies, int, int)>();
             ResetMinFxDates();
 
             _peggedCurrencies = _dataStore.GetPeggedCurrencies()
@@ -61,6 +68,8 @@ namespace ExchangeRate.Core
         internal ExchangeRateRepository(IEnumerable<Entities.ExchangeRate> rates, IExchangeRateProviderFactory exchangeRateSourceFactory)
         {
             _fxRatesBySourceFrequencyAndCurrency = new Dictionary<(ExchangeRateSources, ExchangeRateFrequencies), Dictionary<CurrencyTypes, Dictionary<DateTime, decimal>>>();
+            _loadedMonths = new HashSet<(ExchangeRateSources, ExchangeRateFrequencies, int, int)>();
+            _peggedCurrencies = new Dictionary<CurrencyTypes, PeggedCurrency>();
             ResetMinFxDates();
 
             LoadRates(rates);
@@ -72,6 +81,9 @@ namespace ExchangeRate.Core
         /// Returns the exchange rate for the <paramref name="toCurrency"/> on the given <paramref name="date"/>.
         /// It will return a previously valid rate, if the database does not contain rate for the specified <paramref name="date"/>.
         /// It will return NULL if there is no rate at all for the <paramref name="toCurrency"/>.
+        ///
+        /// KEY IMPROVEMENT: Uses month-based caching to minimize external API calls.
+        /// When a rate is missing, fetches the entire month at once.
         /// </summary>
         public decimal? GetRate(CurrencyTypes fromCurrency, CurrencyTypes toCurrency, DateTime date, ExchangeRateSources source, ExchangeRateFrequencies frequency)
         {
@@ -81,6 +93,9 @@ namespace ExchangeRate.Core
                 return 1m;
 
             date = date.Date;
+
+            // Ensure the month is loaded (single API call for entire month)
+            EnsureMonthLoaded(source, frequency, date);
 
             var minFxDate = GetMinFxDate(date, source, frequency);
 
@@ -110,7 +125,7 @@ namespace ExchangeRate.Core
                 lookupCurrency = currency;
             }
 
-            _logger.LogError("No {source} {frequency} exchange rate found for {lookupCurrency} on {date:yyyy-MM-dd}. Earliest available date: {minFxDate:yyyy-MM-dd}. FromCurrency: {fromCurrency}, ToCurrency: {toCurrency}", source, frequency, lookupCurrency, date, minFxDate, fromCurrency, toCurrency);
+            _logger?.LogError("No {source} {frequency} exchange rate found for {lookupCurrency} on {date:yyyy-MM-dd}. Earliest available date: {minFxDate:yyyy-MM-dd}. FromCurrency: {fromCurrency}, ToCurrency: {toCurrency}", source, frequency, lookupCurrency, date, minFxDate, fromCurrency, toCurrency);
             return null;
         }
 
@@ -348,8 +363,9 @@ namespace ExchangeRate.Core
         }
 
         /// <summary>
-        /// Adds exchange rates to the FX rate dictionaries.
-        /// It should be called to every currency-date pairs once.
+        /// Adds or updates exchange rates in the FX rate dictionaries.
+        /// Supports upsert semantics to allow rate corrections from banks.
+        /// Returns true if the rate was added or updated (needs persistence).
         /// </summary>
         private bool AddRateToDictionaries(Entities.ExchangeRate item)
         {
@@ -367,13 +383,23 @@ namespace ExchangeRate.Core
 
             if (datesByCurrency.TryGetValue(date, out var savedRate))
             {
-                if (decimal.Round(newRate, Entities.ExchangeRate.Precision) != decimal.Round(savedRate, Entities.ExchangeRate.Precision))
+                var roundedNew = decimal.Round(newRate, Entities.ExchangeRate.Precision);
+                var roundedSaved = decimal.Round(savedRate, Entities.ExchangeRate.Precision);
+
+                if (roundedNew != roundedSaved)
                 {
-                    _logger.LogError("Saved exchange rate differs from new value. Currency: {currency}. Saved rate: {savedRate}. New rate: {newRate}. Source: {source}. Frequency: {frequency}", currency, savedRate, newRate, source, frequency);
-                    throw new ExchangeRateException($"_fxRatesByCurrency already contains rate for {currency}-{date:yyyy-MMdd}. Source: {source}. Frequency: {frequency}");
+                    // Rate correction - log for audit trail and update the rate
+                    _logger?.LogInformation(
+                        "Rate correction applied: {Source} {Frequency} {Currency} {Date:yyyy-MM-dd} " +
+                        "changed from {OldRate} to {NewRate}",
+                        source, frequency, currency, date, savedRate, newRate);
+
+                    // Update the rate (upsert semantics)
+                    datesByCurrency[date] = newRate;
+                    return true; // Signal that persistence is needed
                 }
 
-                return false;
+                return false; // No change needed
             }
             else
             {
@@ -490,6 +516,110 @@ namespace ExchangeRate.Core
 
             return ratesByCurrency;
         }
+
+        #region Month-Based Caching
+
+        /// <summary>
+        /// Ensures all rates for the given month are loaded into cache.
+        /// This minimizes API calls by fetching entire months at once.
+        /// </summary>
+        private void EnsureMonthLoaded(ExchangeRateSources source, ExchangeRateFrequencies frequency, DateTime date)
+        {
+            var monthKey = (source, frequency, date.Year, date.Month);
+
+            // Already loaded this month
+            if (_loadedMonths.Contains(monthKey))
+                return;
+
+            var monthStart = PeriodHelper.GetStartOfMonth(date);
+            var monthEnd = monthStart.AddMonths(1);
+
+            // First, try to load from database
+            var dbRates = _dataStore?.GetExchangeRatesAsync(monthStart, monthEnd)
+                .GetAwaiter().GetResult()
+                .Where(r => r.Source == source && r.Frequency == frequency) ?? Enumerable.Empty<Entities.ExchangeRate>();
+
+            foreach (var rate in dbRates)
+                AddRateToDictionaries(rate);
+
+            // If no rates found for this month, fetch from provider
+            if (!HasRatesForMonth(source, frequency, monthStart))
+            {
+                FetchAndStoreMonth(source, frequency, monthStart);
+            }
+
+            _loadedMonths.Add(monthKey);
+        }
+
+        /// <summary>
+        /// Checks if we have any cached rates for the given month.
+        /// </summary>
+        private bool HasRatesForMonth(ExchangeRateSources source, ExchangeRateFrequencies frequency, DateTime monthStart)
+        {
+            if (!_fxRatesBySourceFrequencyAndCurrency.TryGetValue((source, frequency), out var currencies))
+                return false;
+
+            var monthEnd = monthStart.AddMonths(1);
+            return currencies.Values.Any(dates =>
+                dates.Keys.Any(d => d >= monthStart && d < monthEnd));
+        }
+
+        /// <summary>
+        /// Fetches rates for an entire month from the provider and stores them.
+        /// </summary>
+        private void FetchAndStoreMonth(ExchangeRateSources source, ExchangeRateFrequencies frequency, DateTime monthStart)
+        {
+            var provider = _exchangeRateSourceFactory.GetExchangeRateProvider(source);
+            var monthEnd = monthStart.AddMonths(1).AddDays(-1);
+
+            var rates = FetchRatesFromProvider(provider, monthStart, monthEnd, frequency).ToList();
+
+            if (rates.Count == 0)
+            {
+                _logger?.LogWarning(
+                    "No rates returned from {Source} for {Year}-{Month:00}",
+                    source, monthStart.Year, monthStart.Month);
+                return;
+            }
+
+            var itemsToSave = new List<Entities.ExchangeRate>();
+
+            foreach (var rate in rates)
+            {
+                if (AddRateToDictionaries(rate))
+                    itemsToSave.Add(rate);
+            }
+
+            if (itemsToSave.Count > 0 && _dataStore != null)
+            {
+                _dataStore.SaveExchangeRatesAsync(itemsToSave).GetAwaiter().GetResult();
+            }
+        }
+
+        /// <summary>
+        /// Fetches rates from the appropriate provider method based on frequency.
+        /// </summary>
+        private static IEnumerable<Entities.ExchangeRate> FetchRatesFromProvider(
+            IExchangeRateProvider provider,
+            DateTime from,
+            DateTime to,
+            ExchangeRateFrequencies frequency)
+        {
+            return frequency switch
+            {
+                ExchangeRateFrequencies.Daily when provider is IDailyExchangeRateProvider daily
+                    => daily.GetHistoricalDailyFxRates(from, to),
+                ExchangeRateFrequencies.Monthly when provider is IMonthlyExchangeRateProvider monthly
+                    => monthly.GetHistoricalMonthlyFxRates(from, to),
+                ExchangeRateFrequencies.Weekly when provider is IWeeklyExchangeRateProvider weekly
+                    => weekly.GetHistoricalWeeklyFxRates(from, to),
+                ExchangeRateFrequencies.BiWeekly when provider is IBiWeeklyExchangeRateProvider biweekly
+                    => biweekly.GetHistoricalBiWeeklyFxRates(from, to),
+                _ => Enumerable.Empty<Entities.ExchangeRate>()
+            };
+        }
+
+        #endregion
     }
 
     class NotSupportedCurrencyError : Error

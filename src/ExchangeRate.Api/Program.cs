@@ -94,6 +94,7 @@ namespace ExchangeRate.Api.Infrastructure
 {
     /// <summary>
     /// In-memory implementation of IExchangeRateDataStore.
+    /// Supports upsert semantics for rate corrections.
     /// Candidates can replace this with a real database implementation (e.g., EF Core).
     /// </summary>
     public class InMemoryExchangeRateDataStore : IExchangeRateDataStore
@@ -112,18 +113,29 @@ namespace ExchangeRate.Api.Infrastructure
             return Task.FromResult(rates);
         }
 
+        /// <summary>
+        /// Saves or updates exchange rates.
+        /// If a rate already exists for the same key, it is replaced (upsert).
+        /// This enables rate corrections without throwing exceptions.
+        /// </summary>
         public Task SaveExchangeRatesAsync(IEnumerable<ExchangeRate.Core.Entities.ExchangeRate> rates)
         {
             foreach (var rate in rates)
             {
-                var existingRate = _exchangeRates.FirstOrDefault(r =>
+                var existingIndex = _exchangeRates.FindIndex(r =>
                     r.Date == rate.Date &&
                     r.CurrencyId == rate.CurrencyId &&
                     r.Source == rate.Source &&
                     r.Frequency == rate.Frequency);
 
-                if (existingRate == null)
+                if (existingIndex >= 0)
                 {
+                    // Upsert: replace existing rate with corrected value
+                    _exchangeRates[existingIndex] = rate;
+                }
+                else
+                {
+                    // Insert new rate
                     _exchangeRates.Add(rate);
                 }
             }
